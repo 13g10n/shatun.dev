@@ -28,7 +28,7 @@ PROMPT_ENV = Environment(
 )
 
 
-def render_prompt(issue, cfg: Config, cwd: Path, extra_context: str | None = None) -> str:
+def render_prompt(issue, cfg: Config, cwd: Path, agent=None, extra_context: str | None = None) -> str:
     return PROMPT_ENV.get_template("issue.md.j2").render(
         repo=cfg.repo,
         number=issue.number,
@@ -37,6 +37,9 @@ def render_prompt(issue, cfg: Config, cwd: Path, extra_context: str | None = Non
         html_url=issue.html_url or "",
         branch=f"agent/issue-{issue.number}",
         cwd=str(cwd),
+        agent_name=getattr(agent, "name", "") if agent else "",
+        persona=getattr(agent, "persona", "") if agent else "",
+        instructions=getattr(agent, "instructions", "") if agent else "",
         extra_context=extra_context or "",
     )
 
@@ -96,7 +99,8 @@ class Runner:
             if live.stop.is_set():
                 await finish("stopped")
                 return
-            prompt = render_prompt(issue, self.cfg, cwd)
+            agent = await self.store.get_agent(agent_id)
+            prompt = render_prompt(issue, self.cfg, cwd, agent=agent)
             await self.store.update_run(run_id, prompt=prompt)
             env = os.environ.copy()
             if self.cfg.xai_api_key:
@@ -130,7 +134,18 @@ class Runner:
             client = ShatunACPClient(on_event=lambda event: self.store.add_message(run_id, event))
             conn = await connect_grok(client, proc)
             await note(kind="status", title="handshake", text="acp initialize")
-            session_id = await handshake(conn, cwd=str(cwd), api_key=self.cfg.xai_api_key)
+            rules_parts = []
+            if agent and agent.persona:
+                rules_parts.append(f"Persona: {agent.persona}")
+            if agent and agent.instructions:
+                rules_parts.append(agent.instructions)
+            session_id = await handshake(
+                conn,
+                cwd=str(cwd),
+                api_key=self.cfg.xai_api_key,
+                mcp_servers=list(agent.mcp_servers or []) if agent else [],
+                rules="\n\n".join(rules_parts),
+            )
             await note(kind="status", title="session", text=session_id)
             if live.stop.is_set():
                 await finish("stopped")

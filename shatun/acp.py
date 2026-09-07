@@ -18,10 +18,15 @@ from acp.schema import (
     AllowedOutcome,
     ClientCapabilities,
     DeniedOutcome,
+    EnvVariable,
     FileSystemCapabilities,
+    HttpHeader,
+    HttpMcpServer,
     Implementation,
+    McpServerStdio,
     PermissionOption,
     RequestPermissionResponse,
+    SseMcpServer,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
@@ -112,14 +117,50 @@ async def connect_grok(client: ShatunACPClient, proc: Any):
     return connect_to_agent(client, proc.stdin, proc.stdout)
 
 
-async def handshake(conn, cwd: str, api_key: str = "") -> str:
+def mcp_from_config(items: list[dict[str, Any]] | None) -> list:
+    servers: list = []
+    for item in items or []:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        kind = str(item.get("type") or "stdio")
+        env = [
+            EnvVariable(name=str(row["name"]), value=str(row.get("value") or ""))
+            for row in (item.get("env") or [])
+            if isinstance(row, dict) and row.get("name")
+        ]
+        headers = [
+            HttpHeader(name=str(row["name"]), value=str(row.get("value") or ""))
+            for row in (item.get("headers") or [])
+            if isinstance(row, dict) and row.get("name")
+        ]
+        if kind == "http" and item.get("url"):
+            servers.append(HttpMcpServer(name=item["name"], url=item["url"], headers=headers, type="http"))
+        elif kind == "sse" and item.get("url"):
+            servers.append(SseMcpServer(name=item["name"], url=item["url"], headers=headers, type="sse"))
+        elif item.get("command"):
+            args = item.get("args") or []
+            if isinstance(args, str):
+                args = [part for part in args.split(" ") if part]
+            servers.append(
+                McpServerStdio(name=item["name"], command=item["command"], args=list(args), env=env)
+            )
+    return servers
+
+
+async def handshake(
+    conn,
+    cwd: str,
+    api_key: str = "",
+    mcp_servers: list[dict[str, Any]] | None = None,
+    rules: str = "",
+) -> str:
     init = await conn.initialize(
         protocol_version=PROTOCOL_VERSION,
         client_capabilities=ClientCapabilities(
             fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
             terminal=False,
         ),
-        client_info=Implementation(name="shatun", version="0.1.0"),
+        client_info=Implementation(name="shatun", version="0.1.1"),
     )
     methods = [m.id for m in (init.auth_methods or [])]
     if methods:
@@ -128,5 +169,8 @@ async def handshake(conn, cwd: str, api_key: str = "") -> str:
             await conn.authenticate(method_id=method_id, headless=True)
         except Exception:
             log.exception("authenticate failed; trying session/new anyway")
-    session = await conn.new_session(cwd=cwd, mcp_servers=[], autoMode=True)
+    extra: dict[str, Any] = {"autoMode": True}
+    if rules.strip():
+        extra["rules"] = rules.strip()
+    session = await conn.new_session(cwd=cwd, mcp_servers=mcp_from_config(mcp_servers), **extra)
     return session.session_id

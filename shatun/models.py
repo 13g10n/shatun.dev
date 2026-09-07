@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -19,6 +19,7 @@ TASK_STOPPED = "stopped"
 AGENT_IDLE = "idle"
 AGENT_RUNNING = "running"
 AGENT_OFFLINE = "offline"
+AGENT_OOO = "ooo"
 
 PHASE_QUEUED = "queued"
 PHASE_CLONING = "cloning"
@@ -46,6 +47,11 @@ class Agent(TimestampMixin, Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(80), unique=True)
     status: Mapped[str] = mapped_column(String(32), default=AGENT_IDLE)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    persona: Mapped[str] = mapped_column(Text, default="")
+    instructions: Mapped[str] = mapped_column(Text, default="")
+    avatar_seed: Mapped[str] = mapped_column(String(32), default="")
+    mcp_servers: Mapped[list[Any]] = mapped_column(JSONB, default=list)
     current_run_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     runs: Mapped[list[Run]] = relationship(back_populates="agent")
 

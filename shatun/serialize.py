@@ -28,11 +28,27 @@ def has_label(labels: Any, label: str) -> bool:
     return False
 
 
+def agent_display_status(agent: Agent) -> str:
+    if agent.status == "running":
+        return "running"
+    if getattr(agent, "paused", False):
+        return "ooo"
+    if agent.status == "offline":
+        return "offline"
+    return "idle"
+
+
 def agent_view(agent: Agent) -> dict[str, Any]:
     return {
         "id": str(agent.id),
         "name": agent.name,
         "status": agent.status,
+        "display_status": agent_display_status(agent),
+        "paused": bool(getattr(agent, "paused", False)),
+        "persona": getattr(agent, "persona", "") or "",
+        "instructions": getattr(agent, "instructions", "") or "",
+        "avatar_seed": getattr(agent, "avatar_seed", "") or str(agent.id),
+        "mcp_servers": list(getattr(agent, "mcp_servers", None) or []),
         "current_run_id": _id(agent.current_run_id),
         "created_at": _dt(agent.created_at),
         "updated_at": _dt(agent.updated_at),

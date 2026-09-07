@@ -21,11 +21,11 @@ from advanced_alchemy.extensions.litestar import (
     SQLAlchemyAsyncConfig,
     SQLAlchemyPlugin,
 )
-from litestar import Litestar, delete, get, post
+from litestar import Litestar, delete, get, patch, post
 from litestar.datastructures import State
 from litestar.exceptions import HTTPException, NotFoundException
 from litestar.static_files import create_static_files_router
-from msgspec import Struct
+from msgspec import Struct, structs
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -45,6 +45,19 @@ sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
 class AgentCreate(Struct):
     name: str
+    persona: str = ""
+    instructions: str = ""
+    paused: bool = False
+    mcp_servers: list = []
+
+
+class AgentUpdate(Struct):
+    name: str | None = None
+    persona: str | None = None
+    instructions: str | None = None
+    paused: bool | None = None
+    mcp_servers: list | None = None
+    avatar_seed: str | None = None
 
 
 def check_tools(cfg: Config) -> None:
@@ -97,6 +110,11 @@ def create_app(cfg: Config | None = None) -> Litestar:
         scheduler = Scheduler(cfg, store, bus, runner)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT FALSE")
+            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS persona TEXT NOT NULL DEFAULT ''")
+            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS instructions TEXT NOT NULL DEFAULT ''")
+            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_seed VARCHAR(32) NOT NULL DEFAULT ''")
+            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS mcp_servers JSONB NOT NULL DEFAULT '[]'::jsonb")
         await store.recover_stale()
         await store.seed_agent(cfg.default_agent_name)
         stop = asyncio.Event()
@@ -159,8 +177,25 @@ def create_app(cfg: Config | None = None) -> Litestar:
         if not name:
             raise HTTPException(status_code=400, detail="name is required")
         try:
-            agent = await store.add_agent(name)
+            agent = await store.add_agent(
+                name,
+                persona=data.persona,
+                instructions=data.instructions,
+                mcp_servers=list(data.mcp_servers or []),
+                paused=data.paused,
+            )
         except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return agent_view(agent)
+
+    @patch("/api/agents/{agent_id:uuid}")
+    async def api_update_agent(agent_id: UUID, data: AgentUpdate, store: Store) -> dict:
+        fields = {k: v for k, v in structs.asdict(data).items() if v is not None}
+        try:
+            agent = await store.update_agent(agent_id, **fields)
+        except KeyError as exc:
+            raise NotFoundException(detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return agent_view(agent)
 
@@ -237,6 +272,7 @@ def create_app(cfg: Config | None = None) -> Litestar:
         api_status,
         api_agents,
         api_add_agent,
+        api_update_agent,
         api_delete_agent,
         api_issues,
         api_runs,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -48,8 +49,12 @@ class Store:
         async with self.sessions() as session:
             existing = (await session.execute(select(Agent).where(Agent.name == name))).scalar_one_or_none()
             if existing:
+                if not getattr(existing, "avatar_seed", ""):
+                    existing.avatar_seed = secrets.token_hex(8)
+                    await session.commit()
+                    await session.refresh(existing)
                 return existing
-            agent = Agent(name=name, status=AGENT_IDLE)
+            agent = Agent(name=name, status=AGENT_IDLE, avatar_seed=secrets.token_hex(8))
             session.add(agent)
             await session.commit()
             await session.refresh(agent)
@@ -64,9 +69,26 @@ class Store:
         async with self.sessions() as session:
             return await session.get(Agent, agent_id)
 
-    async def add_agent(self, name: str) -> Agent:
+    async def add_agent(
+        self,
+        name: str,
+        *,
+        persona: str = "",
+        instructions: str = "",
+        mcp_servers: list | None = None,
+        paused: bool = False,
+        avatar_seed: str | None = None,
+    ) -> Agent:
         async with self.sessions() as session:
-            agent = Agent(name=name.strip(), status=AGENT_IDLE)
+            agent = Agent(
+                name=name.strip(),
+                status=AGENT_IDLE,
+                persona=persona or "",
+                instructions=instructions or "",
+                mcp_servers=list(mcp_servers or []),
+                paused=bool(paused),
+                avatar_seed=avatar_seed or secrets.token_hex(8),
+            )
             session.add(agent)
             try:
                 await session.commit()
@@ -87,6 +109,25 @@ class Store:
             await session.delete(agent)
             await session.commit()
         await self.bus.publish("agent.deleted", {"id": str(agent_id)}, wake=True)
+
+    async def update_agent(self, agent_id: UUID, **fields: Any) -> Agent:
+        allowed = {"name", "persona", "instructions", "mcp_servers", "paused", "avatar_seed"}
+        async with self.sessions() as session:
+            agent = await session.get(Agent, agent_id)
+            if agent is None:
+                raise KeyError("agent not found")
+            for key, value in fields.items():
+                if key not in allowed:
+                    continue
+                if key == "name" and isinstance(value, str):
+                    value = value.strip()
+                    if not value:
+                        raise ValueError("name is required")
+                setattr(agent, key, value)
+            await session.commit()
+            await session.refresh(agent)
+            await self.bus.publish("agent.updated", agent_view(agent), wake=True)
+            return agent
 
     async def set_agent_status(self, agent_id: UUID, status: str, current_run_id: UUID | None = None) -> None:
         async with self.sessions() as session:
@@ -182,7 +223,13 @@ class Store:
     async def idle_agents(self) -> list[Agent]:
         async with self.sessions() as session:
             return list(
-                (await session.execute(select(Agent).where(Agent.status == AGENT_IDLE).order_by(Agent.created_at))).scalars()
+                (
+                    await session.execute(
+                        select(Agent)
+                        .where(Agent.status == AGENT_IDLE, Agent.paused.is_(False))
+                        .order_by(Agent.created_at)
+                    )
+                ).scalars()
             )
 
     async def insert_run(self, issue_id: UUID, status: str = TASK_QUEUED) -> Run:
