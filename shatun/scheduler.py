@@ -1,4 +1,4 @@
-"""Assign queued work to idle named agents."""
+"""Assign queued work to idle named agents within a project."""
 
 from __future__ import annotations
 
@@ -8,30 +8,30 @@ from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
 
-from shatun.config import Config
 from shatun.events import EventBus
 from shatun.models import AGENT_IDLE, AGENT_RUNNING, TASK_QUEUED
 from shatun.runner import Runner
+from shatun.serialize import has_label
 from shatun.store import Store
 
 log = logging.getLogger("shatun.scheduler")
 
 
 class Scheduler:
-    def __init__(self, cfg: Config, store: Store, bus: EventBus, runner: Runner) -> None:
-        self.cfg = cfg
+    def __init__(self, store: Store, bus: EventBus, runner: Runner) -> None:
         self.store = store
         self.bus = bus
         self.runner = runner
         self._tasks: set[asyncio.Task] = set()
 
-    async def enqueue_issue(self, number: int) -> UUID:
-        issue = await self.store.get_issue_by_number(self.cfg.repo, number)
+    async def enqueue_issue(self, project_id: UUID, number: int) -> UUID:
+        project = await self.store.get_project(project_id)
+        if project is None:
+            raise KeyError("project not found")
+        issue = await self.store.get_issue_by_number(project_id, number)
         if issue is None:
             raise KeyError(f"issue #{number} is not in the database")
-        from shatun.serialize import has_label
-
-        if issue.state != "open" or not has_label(issue.labels_json, self.cfg.label):
+        if issue.state != "open" or not has_label(issue.labels_json, project.label):
             raise ValueError(f"issue #{number} is not eligible")
         if await self.store.active_run_for_issue(issue.id):
             raise ValueError(f"issue #{number} already has an active run")
@@ -60,7 +60,12 @@ class Scheduler:
                     await self._tick()
                 except Exception:
                     log.exception("scheduler tick failed")
-                waiter = asyncio.create_task(pubsub.get_message(ignore_subscribe_messages=True, timeout=self.cfg.scheduler_seconds))
+                try:
+                    settings = await self.store.get_settings()
+                    timeout = max(1, int(settings.scheduler_seconds or 5))
+                except Exception:
+                    timeout = 5
+                waiter = asyncio.create_task(pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout))
                 stopper = asyncio.create_task(stop.wait())
                 done, pending = await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
@@ -71,21 +76,26 @@ class Scheduler:
 
     async def _tick(self) -> None:
         while True:
-            idle = await self.store.idle_agents()
-            if not idle:
+            assigned = False
+            for agent in await self.store.idle_agents():
+                queued = await self.store.oldest_queued(agent.project_id)
+                if queued is None:
+                    project = await self.store.get_project(agent.project_id)
+                    if project is None:
+                        continue
+                    issue = await self.store.oldest_eligible_issue(project)
+                    if issue is None:
+                        continue
+                    queued = await self.store.insert_run(issue.id, TASK_QUEUED)
+                if queued.agent_id and queued.status == "running":
+                    continue
+                await self.store.update_run(queued.id, agent_id=agent.id, status="running")
+                await self.store.set_agent_status(agent.id, AGENT_RUNNING, queued.id)
+                log.info("starting run %s on agent %s", queued.id, agent.name)
+                task = asyncio.create_task(self.runner.execute(queued.id, agent.id), name=f"run-{queued.id}")
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+                assigned = True
+                break
+            if not assigned:
                 return
-            agent = idle[0]
-            queued = await self.store.oldest_queued()
-            if queued is None:
-                issue = await self.store.oldest_eligible_issue(self.cfg.repo, self.cfg.label)
-                if issue is None:
-                    return
-                queued = await self.store.insert_run(issue.id, TASK_QUEUED)
-            if queued.agent_id and queued.status == "running":
-                return
-            await self.store.update_run(queued.id, agent_id=agent.id, status="running")
-            await self.store.set_agent_status(agent.id, AGENT_RUNNING, queued.id)
-            log.info("starting run %s on agent %s", queued.id, agent.name)
-            task = asyncio.create_task(self.runner.execute(queued.id, agent.id), name=f"run-{queued.id}")
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)

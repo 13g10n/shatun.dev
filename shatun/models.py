@@ -41,11 +41,37 @@ class TimestampMixin:
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
-class Agent(TimestampMixin, Base):
-    __tablename__ = "agents"
+class AppSettings(TimestampMixin, Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    grok_bin: Mapped[str] = mapped_column(String(200), default="grok")
+    grok_args: Mapped[list[Any]] = mapped_column(JSONB, default=list)
+    xai_api_key: Mapped[str] = mapped_column(Text, default="")
+    poll_seconds: Mapped[int] = mapped_column(Integer, default=60)
+    scheduler_seconds: Mapped[int] = mapped_column(Integer, default=5)
+    run_timeout_sec: Mapped[int] = mapped_column(Integer, default=2700)
+    default_agent_name: Mapped[str] = mapped_column(String(80), default="Bob")
+
+
+class Project(TimestampMixin, Base):
+    __tablename__ = "projects"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    name: Mapped[str] = mapped_column(String(80), unique=True)
+    title: Mapped[str] = mapped_column(String(200))
+    repo: Mapped[str] = mapped_column(String(200), unique=True)
+    label: Mapped[str] = mapped_column(String(80), default="agent")
+    agents: Mapped[list[Agent]] = relationship(back_populates="project")
+    issues: Mapped[list[Issue]] = relationship(back_populates="project")
+
+
+class Agent(TimestampMixin, Base):
+    __tablename__ = "agents"
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_agents_project_name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(32), default=AGENT_IDLE)
     paused: Mapped[bool] = mapped_column(Boolean, default=False)
     persona: Mapped[str] = mapped_column(Text, default="")
@@ -53,6 +79,7 @@ class Agent(TimestampMixin, Base):
     avatar_seed: Mapped[str] = mapped_column(String(32), default="")
     mcp_servers: Mapped[list[Any]] = mapped_column(JSONB, default=list)
     current_run_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    project: Mapped[Project] = relationship(back_populates="agents")
     runs: Mapped[list[Run]] = relationship(back_populates="agent")
 
 
@@ -61,6 +88,7 @@ class Issue(TimestampMixin, Base):
     __table_args__ = (UniqueConstraint("repo", "number", name="uq_issues_repo_number"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     repo: Mapped[str] = mapped_column(String(200))
     number: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(500), default="")
@@ -69,6 +97,7 @@ class Issue(TimestampMixin, Base):
     labels_json: Mapped[list[Any]] = mapped_column(JSONB, default=list)
     state: Mapped[str] = mapped_column(String(32), default="open")
     github_updated_at: Mapped[str] = mapped_column(String(64), default="")
+    project: Mapped[Project] = relationship(back_populates="issues")
     runs: Mapped[list[Run]] = relationship(back_populates="issue")
 
 

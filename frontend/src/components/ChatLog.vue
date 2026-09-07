@@ -59,19 +59,19 @@ const blocks = computed(() => {
     <div class="space-y-3 p-1 pr-3">
       <p v-if="!blocks.length" class="text-sm text-muted-foreground">{{ empty }}</p>
       <template v-for="block in blocks" :key="block.id">
-        <article v-if="block.kind === 'message'" class="rounded-lg border bg-card px-3 py-2">
-          <div class="chat-text text-sm leading-6">{{ block.text }}</div>
+        <article v-if="block.kind === 'message'" class="px-1 py-2">
+          <div class="chat-text text-[13px] leading-6">{{ block.text }}</div>
         </article>
 
         <Collapsible v-else-if="block.kind === 'thought'" :default-open="false">
-          <article class="rounded-lg border border-violet-900/50 bg-violet-950/20">
-            <CollapsibleTrigger class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-violet-200">
-              <Brain class="size-4" />
-              <span class="font-medium">Thought</span>
-              <ChevronRight class="ml-auto size-4 transition-transform [[data-state=open]_&]:rotate-90" />
+          <article class="rounded-md border border-border/70">
+            <CollapsibleTrigger class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-muted-foreground">
+              <Brain class="size-3.5" />
+              <span>Thought</span>
+              <ChevronRight class="ml-auto size-3.5 transition-transform [[data-state=open]_&]:rotate-90" />
             </CollapsibleTrigger>
             <CollapsibleContent>
-              <div class="chat-text border-t border-violet-900/40 px-3 py-2 text-sm leading-6 text-violet-100/90">
+              <div class="chat-text border-t px-3 py-2 text-[13px] leading-6 text-muted-foreground">
                 {{ block.text }}
               </div>
             </CollapsibleContent>
@@ -79,37 +79,37 @@ const blocks = computed(() => {
         </Collapsible>
 
         <Collapsible v-else-if="block.kind === 'tool'" :default-open="false">
-          <article class="rounded-lg border border-sky-900/50 bg-sky-950/20">
-            <CollapsibleTrigger class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm">
-              <Wrench class="size-4 text-sky-300" />
-              <span class="font-medium truncate">{{ block.title }}</span>
+          <article class="rounded-md border border-border/70">
+            <CollapsibleTrigger class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs">
+              <Wrench class="size-3.5 text-muted-foreground" />
+              <span class="truncate font-medium">{{ block.title }}</span>
               <Badge variant="secondary" class="ml-auto capitalize">{{ block.status }}</Badge>
-              <ChevronRight class="size-4 transition-transform [[data-state=open]_&]:rotate-90" />
+              <ChevronRight class="size-3.5 transition-transform [[data-state=open]_&]:rotate-90" />
             </CollapsibleTrigger>
             <CollapsibleContent>
-              <div class="space-y-2 border-t border-sky-900/40 px-3 py-2">
+              <div class="space-y-2 border-t px-3 py-2">
                 <div v-if="block.input">
-                  <p class="mb-1 text-[11px] uppercase tracking-wide text-muted-foreground">Input</p>
-                  <pre class="chat-text overflow-x-auto rounded-md bg-black/30 p-2 text-xs">{{ block.input }}</pre>
+                  <p class="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Input</p>
+                  <pre class="chat-text overflow-x-auto rounded-md bg-muted/40 p-2 text-xs">{{ block.input }}</pre>
                 </div>
                 <div v-if="block.output">
-                  <p class="mb-1 text-[11px] uppercase tracking-wide text-muted-foreground">Result</p>
-                  <pre class="chat-text overflow-x-auto rounded-md bg-black/30 p-2 text-xs">{{ block.output }}</pre>
+                  <p class="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Result</p>
+                  <pre class="chat-text overflow-x-auto rounded-md bg-muted/40 p-2 text-xs">{{ block.output }}</pre>
                 </div>
               </div>
             </CollapsibleContent>
           </article>
         </Collapsible>
 
-        <article v-else-if="block.kind === 'stderr'" class="rounded-lg border border-red-900/50 bg-red-950/20 px-3 py-2">
-          <div class="mb-1 flex items-center gap-2 text-xs text-red-300">
+        <article v-else-if="block.kind === 'stderr'" class="rounded-md border border-destructive/30 px-3 py-2">
+          <div class="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-wide text-red-300">
             <Terminal class="size-3.5" />
             stderr
           </div>
-          <pre class="chat-text text-xs text-red-100/90">{{ block.text }}</pre>
+          <pre class="chat-text text-xs text-red-100/80">{{ block.text }}</pre>
         </article>
 
-        <article v-else class="rounded-lg border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <article v-else class="px-1 py-1.5 text-xs text-muted-foreground">
           <div class="mb-1 uppercase tracking-wide">{{ block.kind }}{{ block.title ? ` · ${block.title}` : "" }}</div>
           <div class="chat-text">{{ block.text }}</div>
         </article>

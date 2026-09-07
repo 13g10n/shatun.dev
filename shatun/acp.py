@@ -160,7 +160,7 @@ async def handshake(
             fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
             terminal=False,
         ),
-        client_info=Implementation(name="shatun", version="0.1.1"),
+        client_info=Implementation(name="shatun", version="0.1.2"),
     )
     methods = [m.id for m in (init.auth_methods or [])]
     if methods:

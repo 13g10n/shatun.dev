@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
+from shatun.config import DEFAULT_GROK_ARGS, normalize_repo
 from shatun.events import EventBus
 from shatun.models import (
     AGENT_IDLE,
@@ -24,11 +25,13 @@ from shatun.models import (
     TASK_QUEUED,
     TASK_RUNNING,
     Agent,
+    AppSettings,
     Issue,
     Message,
+    Project,
     Run,
 )
-from shatun.serialize import agent_view, has_label, issue_view, message_view, run_view
+from shatun.serialize import agent_view, has_label, message_view, project_view, run_view, settings_view
 
 log = logging.getLogger("shatun.store")
 PR_LINE = re.compile(r"^PR:\s*(\S+)", re.MULTILINE)
@@ -45,25 +48,228 @@ class Store:
         self.bus = bus
         self.log_root = log_root
 
-    async def seed_agent(self, name: str) -> Agent:
+    async def bootstrap_data(self, legacy: dict[str, Any] | None = None) -> AppSettings:
+        settings = await self.ensure_settings(legacy)
+        await self._backfill_projects(legacy)
         async with self.sessions() as session:
-            existing = (await session.execute(select(Agent).where(Agent.name == name))).scalar_one_or_none()
+            await session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_project_name ON agents (project_id, name)"))
+            await session.commit()
+        return settings
+
+    async def ensure_settings(self, legacy: dict[str, Any] | None = None) -> AppSettings:
+        async with self.sessions() as session:
+            row = await session.get(AppSettings, 1)
+            if row:
+                return row
+            src = legacy or {}
+            row = AppSettings(
+                id=1,
+                grok_bin=str(src.get("grok_bin") or "grok"),
+                grok_args=list(src.get("grok_args") or list(DEFAULT_GROK_ARGS)),
+                xai_api_key=str(src.get("xai_api_key") or ""),
+                poll_seconds=int(src.get("poll_seconds") or 60),
+                scheduler_seconds=int(src.get("scheduler_seconds") or 5),
+                run_timeout_sec=int(src.get("run_timeout_sec") or 2700),
+                default_agent_name=str(src.get("default_agent_name") or "Bob"),
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def get_settings(self) -> AppSettings:
+        async with self.sessions() as session:
+            row = await session.get(AppSettings, 1)
+            if row is None:
+                raise RuntimeError("app settings are missing")
+            return row
+
+    async def update_settings(self, **fields: Any) -> AppSettings:
+        allowed = {
+            "grok_bin",
+            "grok_args",
+            "xai_api_key",
+            "poll_seconds",
+            "scheduler_seconds",
+            "run_timeout_sec",
+            "default_agent_name",
+        }
+        async with self.sessions() as session:
+            row = await session.get(AppSettings, 1)
+            if row is None:
+                raise RuntimeError("app settings are missing")
+            for key, value in fields.items():
+                if key not in allowed or value is None:
+                    continue
+                if key == "grok_bin":
+                    value = str(value).strip() or "grok"
+                elif key == "default_agent_name":
+                    value = str(value).strip() or "Bob"
+                elif key == "grok_args":
+                    value = [str(item) for item in value if str(item).strip()]
+                    if not value:
+                        value = list(DEFAULT_GROK_ARGS)
+                elif key in {"poll_seconds", "scheduler_seconds", "run_timeout_sec"}:
+                    value = max(1, int(value))
+                elif key == "xai_api_key":
+                    value = str(value)
+                setattr(row, key, value)
+            await session.commit()
+            await session.refresh(row)
+            await self.bus.publish("settings.updated", settings_view(row), wake=True)
+            return row
+
+    async def _backfill_projects(self, legacy: dict[str, Any] | None) -> None:
+        async with self.sessions() as session:
+            orphan_agents = list((await session.execute(select(Agent).where(Agent.project_id.is_(None)))).scalars())
+            orphan_issues = list((await session.execute(select(Issue).where(Issue.project_id.is_(None)))).scalars())
+            if not orphan_agents and not orphan_issues:
+                return
+            repo = ""
+            label = "agent"
+            if orphan_issues:
+                repo = orphan_issues[0].repo
+            elif legacy and legacy.get("repo"):
+                try:
+                    repo = normalize_repo(str(legacy["repo"]))
+                except ValueError:
+                    repo = ""
+            if legacy and legacy.get("label"):
+                label = str(legacy["label"])
+            if not repo:
+                repo = "imported/local"
+            existing = (await session.execute(select(Project).where(Project.repo == repo))).scalar_one_or_none()
+            if existing is None:
+                title = repo.split("/")[-1] or "Imported"
+                existing = Project(title=title, repo=repo, label=label)
+                session.add(existing)
+                await session.flush()
+            for agent in orphan_agents:
+                agent.project_id = existing.id
+            for issue in orphan_issues:
+                issue.project_id = existing.id
+                if not issue.repo:
+                    issue.repo = existing.repo
+            await session.commit()
+
+    async def list_projects(self) -> list[Project]:
+        async with self.sessions() as session:
+            return list((await session.execute(select(Project).order_by(Project.created_at))).scalars())
+
+    async def project_counts(self, project_id: UUID) -> tuple[int, int, int]:
+        async with self.sessions() as session:
+            agents = (await session.execute(select(func.count(Agent.id)).where(Agent.project_id == project_id))).scalar_one()
+            running = (
+                await session.execute(
+                    select(func.count(Agent.id)).where(Agent.project_id == project_id, Agent.status == AGENT_RUNNING)
+                )
+            ).scalar_one()
+            tasks = (await session.execute(select(func.count(Issue.id)).where(Issue.project_id == project_id))).scalar_one()
+            return int(agents), int(running), int(tasks)
+
+    async def get_project(self, project_id: UUID) -> Project | None:
+        async with self.sessions() as session:
+            return await session.get(Project, project_id)
+
+    async def add_project(self, title: str, repo: str, label: str = "agent") -> Project:
+        repo = normalize_repo(repo)
+        title = title.strip() or repo.split("/")[-1]
+        label = (label or "agent").strip() or "agent"
+        async with self.sessions() as session:
+            existing = (await session.execute(select(Project).where(Project.repo == repo))).scalar_one_or_none()
+            if existing:
+                raise ValueError(f"project for {repo} already exists")
+            project = Project(title=title, repo=repo, label=label)
+            session.add(project)
+            try:
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                raise ValueError(f"could not create project {repo}") from exc
+            await session.refresh(project)
+        settings = await self.get_settings()
+        await self.seed_agent(project.id, settings.default_agent_name)
+        await self.bus.publish("project.created", project_view(project, agent_count=1), wake=True)
+        return project
+
+    async def update_project(self, project_id: UUID, **fields: Any) -> Project:
+        allowed = {"title", "repo", "label"}
+        async with self.sessions() as session:
+            project = await session.get(Project, project_id)
+            if project is None:
+                raise KeyError("project not found")
+            for key, value in fields.items():
+                if key not in allowed or value is None:
+                    continue
+                if key == "title":
+                    value = str(value).strip()
+                    if not value:
+                        raise ValueError("title is required")
+                elif key == "repo":
+                    value = normalize_repo(str(value))
+                elif key == "label":
+                    value = str(value).strip() or "agent"
+                setattr(project, key, value)
+            if "repo" in fields and fields["repo"] is not None:
+                for issue in (
+                    await session.execute(select(Issue).where(Issue.project_id == project_id))
+                ).scalars():
+                    issue.repo = project.repo
+            await session.commit()
+            await session.refresh(project)
+            await self.bus.publish("project.updated", project_view(project), wake=True)
+            return project
+
+    async def delete_project(self, project_id: UUID) -> None:
+        async with self.sessions() as session:
+            project = await session.get(Project, project_id)
+            if project is None:
+                raise KeyError("project not found")
+            running = (
+                await session.execute(
+                    select(func.count(Agent.id)).where(Agent.project_id == project_id, Agent.status == AGENT_RUNNING)
+                )
+            ).scalar_one()
+            if running:
+                raise ValueError("cannot delete a project with a running agent")
+            issue_ids = list(
+                (await session.execute(select(Issue.id).where(Issue.project_id == project_id))).scalars()
+            )
+            if issue_ids:
+                run_ids = list((await session.execute(select(Run.id).where(Run.issue_id.in_(issue_ids)))).scalars())
+                if run_ids:
+                    await session.execute(delete(Message).where(Message.run_id.in_(run_ids)))
+                    await session.execute(delete(Run).where(Run.id.in_(run_ids)))
+                await session.execute(delete(Issue).where(Issue.id.in_(issue_ids)))
+            await session.execute(delete(Agent).where(Agent.project_id == project_id))
+            await session.delete(project)
+            await session.commit()
+        await self.bus.publish("project.deleted", {"id": str(project_id)}, wake=True)
+
+    async def seed_agent(self, project_id: UUID, name: str) -> Agent:
+        async with self.sessions() as session:
+            existing = (
+                await session.execute(select(Agent).where(Agent.project_id == project_id, Agent.name == name))
+            ).scalar_one_or_none()
             if existing:
                 if not getattr(existing, "avatar_seed", ""):
                     existing.avatar_seed = secrets.token_hex(8)
                     await session.commit()
                     await session.refresh(existing)
                 return existing
-            agent = Agent(name=name, status=AGENT_IDLE, avatar_seed=secrets.token_hex(8))
+            agent = Agent(project_id=project_id, name=name, status=AGENT_IDLE, avatar_seed=secrets.token_hex(8))
             session.add(agent)
             await session.commit()
             await session.refresh(agent)
             await self.bus.publish("agent.created", agent_view(agent), wake=True)
             return agent
 
-    async def list_agents(self) -> list[Agent]:
+    async def list_agents(self, project_id: UUID | None = None) -> list[Agent]:
         async with self.sessions() as session:
-            return list((await session.execute(select(Agent).order_by(Agent.created_at))).scalars())
+            q = select(Agent).order_by(Agent.created_at)
+            if project_id is not None:
+                q = q.where(Agent.project_id == project_id)
+            return list((await session.execute(q)).scalars())
 
     async def get_agent(self, agent_id: UUID) -> Agent | None:
         async with self.sessions() as session:
@@ -73,6 +279,7 @@ class Store:
         self,
         name: str,
         *,
+        project_id: UUID,
         persona: str = "",
         instructions: str = "",
         mcp_servers: list | None = None,
@@ -80,7 +287,11 @@ class Store:
         avatar_seed: str | None = None,
     ) -> Agent:
         async with self.sessions() as session:
+            project = await session.get(Project, project_id)
+            if project is None:
+                raise KeyError("project not found")
             agent = Agent(
+                project_id=project_id,
                 name=name.strip(),
                 status=AGENT_IDLE,
                 persona=persona or "",
@@ -140,15 +351,17 @@ class Store:
             await session.refresh(agent)
             await self.bus.publish("agent.updated", agent_view(agent))
 
-    async def upsert_issue(self, repo: str, item: dict[str, Any]) -> Issue:
+    async def upsert_issue(self, project: Project, item: dict[str, Any]) -> Issue:
         number = int(item["number"])
         async with self.sessions() as session:
             issue = (
-                await session.execute(select(Issue).where(Issue.repo == repo, Issue.number == number))
+                await session.execute(select(Issue).where(Issue.repo == project.repo, Issue.number == number))
             ).scalar_one_or_none()
             if issue is None:
-                issue = Issue(repo=repo, number=number)
+                issue = Issue(project_id=project.id, repo=project.repo, number=number)
                 session.add(issue)
+            issue.project_id = project.id
+            issue.repo = project.repo
             issue.title = str(item.get("title") or "")
             issue.body = str(item.get("body") or "")
             issue.html_url = str(item.get("url") or "")
@@ -157,12 +370,12 @@ class Store:
             issue.github_updated_at = str(item.get("updatedAt") or "")
             await session.commit()
             await session.refresh(issue)
-            await self.bus.publish("issue.updated", {"id": str(issue.id), "number": issue.number})
+            await self.bus.publish("issue.updated", {"id": str(issue.id), "number": issue.number, "project_id": str(project.id)})
             return issue
 
-    async def mark_missing_closed(self, repo: str, seen: list[int]) -> None:
+    async def mark_missing_closed(self, project: Project, seen: list[int]) -> None:
         async with self.sessions() as session:
-            q = select(Issue).where(Issue.repo == repo, Issue.state == "open")
+            q = select(Issue).where(Issue.project_id == project.id, Issue.state == "open")
             if seen:
                 q = q.where(Issue.number.not_in(seen))
             rows = list((await session.execute(q)).scalars())
@@ -170,16 +383,30 @@ class Store:
                 issue.state = "closed"
             await session.commit()
 
-    async def list_issues(self, repo: str) -> list[Issue]:
+    async def list_issues(self, project_id: UUID) -> list[Issue]:
         async with self.sessions() as session:
             return list(
-                (await session.execute(select(Issue).where(Issue.repo == repo).order_by(Issue.number.desc()))).scalars()
+                (
+                    await session.execute(
+                        select(Issue).where(Issue.project_id == project_id).order_by(Issue.number.desc())
+                    )
+                ).scalars()
             )
 
-    async def get_issue_by_number(self, repo: str, number: int) -> Issue | None:
+    async def get_issue(self, issue_id: UUID) -> Issue | None:
         async with self.sessions() as session:
             return (
-                await session.execute(select(Issue).where(Issue.repo == repo, Issue.number == number))
+                await session.execute(select(Issue).options(selectinload(Issue.project)).where(Issue.id == issue_id))
+            ).scalar_one_or_none()
+
+    async def get_issue_by_number(self, project_id: UUID, number: int) -> Issue | None:
+        async with self.sessions() as session:
+            return (
+                await session.execute(
+                    select(Issue)
+                    .options(selectinload(Issue.project))
+                    .where(Issue.project_id == project_id, Issue.number == number)
+                )
             ).scalar_one_or_none()
 
     def _active_run_query(self, issue_id: UUID) -> Select[tuple[Run]]:
@@ -189,48 +416,69 @@ class Store:
         async with self.sessions() as session:
             return (await session.execute(self._active_run_query(issue_id))).scalar_one_or_none()
 
-    async def oldest_queued(self) -> Run | None:
+    async def latest_run_for_issue(self, issue_id: UUID) -> Run | None:
         async with self.sessions() as session:
             return (
                 await session.execute(
                     select(Run)
                     .options(selectinload(Run.issue), selectinload(Run.agent))
-                    .where(Run.status == TASK_QUEUED)
+                    .where(Run.issue_id == issue_id)
+                    .order_by(Run.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+    async def list_runs_for_issue(self, issue_id: UUID) -> list[Run]:
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(Run)
+                        .options(selectinload(Run.issue), selectinload(Run.agent))
+                        .where(Run.issue_id == issue_id)
+                        .order_by(Run.created_at.desc())
+                    )
+                ).scalars()
+            )
+
+    async def oldest_queued(self, project_id: UUID) -> Run | None:
+        async with self.sessions() as session:
+            return (
+                await session.execute(
+                    select(Run)
+                    .join(Issue, Run.issue_id == Issue.id)
+                    .options(selectinload(Run.issue), selectinload(Run.agent))
+                    .where(Run.status == TASK_QUEUED, Issue.project_id == project_id)
                     .order_by(Run.created_at.asc())
                     .limit(1)
                 )
             ).scalar_one_or_none()
 
-    async def oldest_eligible_issue(self, repo: str, label: str) -> Issue | None:
+    async def oldest_eligible_issue(self, project: Project) -> Issue | None:
         async with self.sessions() as session:
             issues = list(
                 (
                     await session.execute(
-                        select(Issue).where(Issue.repo == repo, Issue.state == "open").order_by(Issue.github_updated_at.asc())
+                        select(Issue)
+                        .where(Issue.project_id == project.id, Issue.state == "open")
+                        .order_by(Issue.github_updated_at.asc())
                     )
                 ).scalars()
             )
             for issue in issues:
-                if not has_label(issue.labels_json, label):
+                if not has_label(issue.labels_json, project.label):
                     continue
-                existing = (
-                    await session.execute(select(Run.id).where(Run.issue_id == issue.id).limit(1))
-                ).first()
+                existing = (await session.execute(select(Run.id).where(Run.issue_id == issue.id).limit(1))).first()
                 if existing is None:
                     return issue
             return None
 
-    async def idle_agents(self) -> list[Agent]:
+    async def idle_agents(self, project_id: UUID | None = None) -> list[Agent]:
         async with self.sessions() as session:
-            return list(
-                (
-                    await session.execute(
-                        select(Agent)
-                        .where(Agent.status == AGENT_IDLE, Agent.paused.is_(False))
-                        .order_by(Agent.created_at)
-                    )
-                ).scalars()
-            )
+            q = select(Agent).where(Agent.status == AGENT_IDLE, Agent.paused.is_(False)).order_by(Agent.created_at)
+            if project_id is not None:
+                q = q.where(Agent.project_id == project_id)
+            return list((await session.execute(q)).scalars())
 
     async def insert_run(self, issue_id: UUID, status: str = TASK_QUEUED) -> Run:
         async with self.sessions() as session:
@@ -249,22 +497,29 @@ class Store:
         async with self.sessions() as session:
             return (
                 await session.execute(
-                    select(Run).options(selectinload(Run.issue), selectinload(Run.agent)).where(Run.id == run_id)
+                    select(Run)
+                    .options(selectinload(Run.issue).selectinload(Issue.project), selectinload(Run.agent))
+                    .where(Run.id == run_id)
                 )
             ).scalar_one_or_none()
 
-    async def list_runs(self, limit: int = 50) -> list[Run]:
+    async def list_runs(
+        self,
+        *,
+        project_id: UUID | None = None,
+        agent_id: UUID | None = None,
+        issue_id: UUID | None = None,
+        limit: int = 80,
+    ) -> list[Run]:
         async with self.sessions() as session:
-            return list(
-                (
-                    await session.execute(
-                        select(Run)
-                        .options(selectinload(Run.issue), selectinload(Run.agent))
-                        .order_by(Run.created_at.desc())
-                        .limit(limit)
-                    )
-                ).scalars()
-            )
+            q = select(Run).options(selectinload(Run.issue), selectinload(Run.agent)).order_by(Run.created_at.desc())
+            if issue_id is not None:
+                q = q.where(Run.issue_id == issue_id)
+            if agent_id is not None:
+                q = q.where(Run.agent_id == agent_id)
+            if project_id is not None:
+                q = q.join(Issue, Run.issue_id == Issue.id).where(Issue.project_id == project_id)
+            return list((await session.execute(q.limit(limit))).scalars())
 
     async def list_messages(self, run_id: UUID) -> list[Message]:
         async with self.sessions() as session:
@@ -280,7 +535,9 @@ class Store:
         async with self.sessions() as session:
             run = (
                 await session.execute(
-                    select(Run).options(selectinload(Run.issue), selectinload(Run.agent)).where(Run.id == run_id)
+                    select(Run)
+                    .options(selectinload(Run.issue).selectinload(Issue.project), selectinload(Run.agent))
+                    .where(Run.id == run_id)
                 )
             ).scalar_one_or_none()
             if run is None:

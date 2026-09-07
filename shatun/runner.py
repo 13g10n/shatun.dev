@@ -12,7 +12,7 @@ from uuid import UUID
 from jinja2 import Environment, FileSystemLoader
 
 from shatun.acp import ShatunACPClient, connect_grok, handshake
-from shatun.config import PACKAGE_DIR, Config
+from shatun.config import PACKAGE_DIR, RuntimeConfig
 from shatun.models import AGENT_IDLE, PHASE_CLONING, PHASE_DONE, PHASE_HANDSHAKE, PHASE_PROMPTING
 from shatun.runtime import Runtime, kill_proc
 from shatun.store import Store, utcnow
@@ -28,9 +28,9 @@ PROMPT_ENV = Environment(
 )
 
 
-def render_prompt(issue, cfg: Config, cwd: Path, agent=None, extra_context: str | None = None) -> str:
+def render_prompt(issue, repo: str, cwd: Path, agent=None, extra_context: str | None = None) -> str:
     return PROMPT_ENV.get_template("issue.md.j2").render(
-        repo=cfg.repo,
+        repo=repo,
         number=issue.number,
         title=issue.title,
         body=issue.body or "",
@@ -45,7 +45,7 @@ def render_prompt(issue, cfg: Config, cwd: Path, agent=None, extra_context: str 
 
 
 class Runner:
-    def __init__(self, cfg: Config, store: Store, runtime: Runtime) -> None:
+    def __init__(self, cfg: RuntimeConfig, store: Store, runtime: Runtime) -> None:
         self.cfg = cfg
         self.store = store
         self.runtime = runtime
@@ -59,6 +59,8 @@ class Runner:
             self.runtime.clear(agent_id)
             return
         issue = run.issue
+        repo = issue.repo
+        settings = await self.store.get_settings()
         log_path = self.cfg.log_root / f"{run_id}.jsonl"
         cwd = self.cfg.work_root / str(run_id) / "repo"
         finished = False
@@ -87,10 +89,10 @@ class Runner:
                 run_id, cwd=str(cwd), log_path=str(log_path), started_at=utcnow(),
                 status="running", phase=PHASE_CLONING, agent_id=agent_id,
             )
-            await note(kind="status", title="cloning", text=f"cloning {self.cfg.repo}")
+            await note(kind="status", title="cloning", text=f"cloning {repo}")
             cwd.parent.mkdir(parents=True, exist_ok=True)
             clone = await asyncio.create_subprocess_exec(
-                "gh", "repo", "clone", self.cfg.repo, str(cwd), "--", "--depth", "1",
+                "gh", "repo", "clone", repo, str(cwd), "--", "--depth", "1",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             out, err = await clone.communicate()
@@ -100,15 +102,15 @@ class Runner:
                 await finish("stopped")
                 return
             agent = await self.store.get_agent(agent_id)
-            prompt = render_prompt(issue, self.cfg, cwd, agent=agent)
+            prompt = render_prompt(issue, repo, cwd, agent=agent)
             await self.store.update_run(run_id, prompt=prompt)
             env = os.environ.copy()
-            if self.cfg.xai_api_key:
-                env["XAI_API_KEY"] = self.cfg.xai_api_key
+            if settings.xai_api_key:
+                env["XAI_API_KEY"] = settings.xai_api_key
             await self.store.update_run(run_id, phase=PHASE_HANDSHAKE)
             proc = await asyncio.create_subprocess_exec(
-                self.cfg.grok_bin,
-                *self.cfg.grok_args,
+                settings.grok_bin,
+                *list(settings.grok_args or []),
                 cwd=str(cwd),
                 env=env,
                 stdin=asyncio.subprocess.PIPE,
@@ -142,7 +144,7 @@ class Runner:
             session_id = await handshake(
                 conn,
                 cwd=str(cwd),
-                api_key=self.cfg.xai_api_key,
+                api_key=settings.xai_api_key,
                 mcp_servers=list(agent.mcp_servers or []) if agent else [],
                 rules="\n\n".join(rules_parts),
             )
@@ -155,7 +157,7 @@ class Runner:
 
             result = await asyncio.wait_for(
                 conn.prompt(session_id=session_id, prompt=[text_block(prompt)]),
-                timeout=self.cfg.run_timeout_sec,
+                timeout=settings.run_timeout_sec,
             )
             await note(kind="status", title="acp done", text=str(getattr(result, "stop_reason", result)))
             code = await kill_proc(proc, grace=5)

@@ -7,18 +7,15 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from shatun.config import load_config
+from shatun.config import load_runtime
 from shatun.models import Base
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-try:
-    cfg = load_config()
-    config.set_main_option("sqlalchemy.url", cfg.database_url)
-except SystemExit:
-    pass
+cfg = load_runtime()
+config.set_main_option("sqlalchemy.url", cfg.database_url)
 
 target_metadata = Base.metadata
 

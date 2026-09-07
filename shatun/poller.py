@@ -7,21 +7,21 @@ import json
 import logging
 import subprocess
 
-from shatun.config import Config
+from shatun.models import Project
 from shatun.store import Store
 
 log = logging.getLogger("shatun.poller")
 
 
-def fetch_issues(cfg: Config) -> list[dict]:
+def fetch_issues(repo: str, label: str) -> list[dict]:
     cmd = [
         "gh",
         "issue",
         "list",
         "--repo",
-        cfg.repo,
+        repo,
         "--label",
-        cfg.label,
+        label,
         "--state",
         "open",
         "--limit",
@@ -38,25 +38,49 @@ def fetch_issues(cfg: Config) -> list[dict]:
     return data
 
 
-async def poll_once(cfg: Config, store: Store) -> int:
-    issues = await asyncio.to_thread(fetch_issues, cfg)
+async def poll_project(project: Project, store: Store) -> int:
+    issues = await asyncio.to_thread(fetch_issues, project.repo, project.label)
     seen: list[int] = []
     for item in issues:
         seen.append(int(item["number"]))
-        await store.upsert_issue(cfg.repo, item)
-    await store.mark_missing_closed(cfg.repo, seen)
-    log.info("polled %s issues from %s", len(seen), cfg.repo)
-    await store.bus.publish("issues.polled", {"count": len(seen)}, wake=True)
+        await store.upsert_issue(project, item)
+    await store.mark_missing_closed(project, seen)
+    log.info("polled %s issues from %s", len(seen), project.repo)
+    await store.bus.publish(
+        "issues.polled",
+        {"count": len(seen), "project_id": str(project.id), "repo": project.repo},
+        wake=True,
+    )
     return len(seen)
 
 
-async def poller_loop(cfg: Config, store: Store, stop: asyncio.Event) -> None:
+async def poll_once(store: Store, project_id=None) -> int:
+    total = 0
+    if project_id is not None:
+        project = await store.get_project(project_id)
+        projects = [project] if project else []
+    else:
+        projects = await store.list_projects()
+    for project in projects:
+        try:
+            total += await poll_project(project, store)
+        except Exception:
+            log.exception("poll failed for %s", project.repo)
+    return total
+
+
+async def poller_loop(store: Store, stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
-            await poll_once(cfg, store)
+            await poll_once(store)
         except Exception:
             log.exception("poll failed")
         try:
-            await asyncio.wait_for(stop.wait(), timeout=cfg.poll_seconds)
+            settings = await store.get_settings()
+            timeout = max(5, int(settings.poll_seconds or 60))
+        except Exception:
+            timeout = 60
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=timeout)
         except TimeoutError:
             continue

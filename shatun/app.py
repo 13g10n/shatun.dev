@@ -29,18 +29,31 @@ from msgspec import Struct, structs
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from shatun.config import ROOT_DIR, Config, ensure_dirs, load_config
+from shatun.config import ROOT_DIR, RuntimeConfig, ensure_dirs, load_runtime, read_legacy_toml
 from shatun.events import EventBus
 from shatun.models import Base
-from shatun.poller import poller_loop
+from shatun.poller import poll_once, poller_loop
 from shatun.runner import Runner
 from shatun.runtime import Runtime
 from shatun.scheduler import Scheduler
-from shatun.serialize import agent_view, issue_view, message_view, run_view
+from shatun.schema import bootstrap_schema
+from shatun.serialize import agent_view, message_view, project_view, run_view, settings_view, task_view
 from shatun.store import Store
 
 log = logging.getLogger("shatun")
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
+
+
+class ProjectCreate(Struct):
+    title: str
+    repo: str
+    label: str = "agent"
+
+
+class ProjectUpdate(Struct):
+    title: str | None = None
+    repo: str | None = None
+    label: str | None = None
 
 
 class AgentCreate(Struct):
@@ -60,24 +73,45 @@ class AgentUpdate(Struct):
     avatar_seed: str | None = None
 
 
-def check_tools(cfg: Config) -> None:
+class SettingsUpdate(Struct):
+    grok_bin: str | None = None
+    grok_args: list | None = None
+    xai_api_key: str | None = None
+    poll_seconds: int | None = None
+    scheduler_seconds: int | None = None
+    run_timeout_sec: int | None = None
+    default_agent_name: str | None = None
+
+
+def check_gh() -> None:
     if shutil.which("gh") is None:
         raise SystemExit("gh CLI not found on PATH")
-    grok = cfg.grok_bin
+    try:
+        result = subprocess.run(["gh", "--version"], capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        raise SystemExit("missing required binary: gh") from None
+    line = (result.stdout or result.stderr or "").strip().splitlines()
+    print(f"gh: {line[0] if line else 'ok'}", flush=True)
+
+
+def check_grok(bin_path: str) -> None:
+    grok = bin_path or "grok"
     if Path(grok).name == grok and shutil.which(grok) is None:
-        raise SystemExit(f"{grok} not found on PATH")
+        print(f"warning: {grok} not found on PATH", file=sys.stderr, flush=True)
+        return
     if Path(grok).name != grok and not Path(grok).is_file():
-        raise SystemExit(f"grok binary not found: {grok}")
-    for argv, label in ((["gh", "--version"], "gh"), ([cfg.grok_bin, "--version"], "grok")):
-        try:
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-        except FileNotFoundError:
-            raise SystemExit(f"missing required binary: {argv[0]}") from None
-        line = (result.stdout or result.stderr or "").strip().splitlines()
-        print(f"{label}: {line[0] if line else 'ok'}", flush=True)
+        print(f"warning: grok binary not found: {grok}", file=sys.stderr, flush=True)
+        return
+    try:
+        result = subprocess.run([grok, "--version"], capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        print(f"warning: missing grok binary: {grok}", file=sys.stderr, flush=True)
+        return
+    line = (result.stdout or result.stderr or "").strip().splitlines()
+    print(f"grok: {line[0] if line else 'ok'}", flush=True)
 
 
-def alchemy_config(cfg: Config) -> SQLAlchemyAsyncConfig:
+def alchemy_config(cfg: RuntimeConfig) -> SQLAlchemyAsyncConfig:
     return SQLAlchemyAsyncConfig(
         connection_string=cfg.database_url,
         metadata=Base.metadata,
@@ -88,8 +122,13 @@ def alchemy_config(cfg: Config) -> SQLAlchemyAsyncConfig:
     )
 
 
-def create_app(cfg: Config | None = None) -> Litestar:
-    cfg = cfg or load_config()
+async def _project_payload(store: Store, project) -> dict:
+    agents, running, tasks = await store.project_counts(project.id)
+    return project_view(project, agent_count=agents, running=running, task_count=tasks)
+
+
+def create_app(cfg: RuntimeConfig | None = None) -> Litestar:
+    cfg = cfg or load_runtime()
     ensure_dirs(cfg)
     db_config = alchemy_config(cfg)
     frontend_dist = ROOT_DIR / "frontend" / "dist"
@@ -107,16 +146,12 @@ def create_app(cfg: Config | None = None) -> Litestar:
         store = Store(sessions, bus, cfg.log_root)
         runtime = Runtime()
         runner = Runner(cfg, store, runtime)
-        scheduler = Scheduler(cfg, store, bus, runner)
+        scheduler = Scheduler(store, bus, runner)
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT FALSE")
-            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS persona TEXT NOT NULL DEFAULT ''")
-            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS instructions TEXT NOT NULL DEFAULT ''")
-            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_seed VARCHAR(32) NOT NULL DEFAULT ''")
-            await conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN IF NOT EXISTS mcp_servers JSONB NOT NULL DEFAULT '[]'::jsonb")
+            await bootstrap_schema(conn)
         await store.recover_stale()
-        await store.seed_agent(cfg.default_agent_name)
+        settings = await store.bootstrap_data(read_legacy_toml())
+        check_grok(settings.grok_bin)
         stop = asyncio.Event()
         app.state.cfg = cfg
         app.state.store = store
@@ -139,7 +174,7 @@ def create_app(cfg: Config | None = None) -> Litestar:
             finally:
                 await pubsub.aclose()
 
-        poller_task = asyncio.create_task(poller_loop(cfg, store, stop), name="poller")
+        poller_task = asyncio.create_task(poller_loop(store, stop), name="poller")
         sched_task = asyncio.create_task(scheduler.loop(stop), name="scheduler")
         forward_task = asyncio.create_task(forward(), name="redis-forward")
         log.info("listening on http://%s:%s", cfg.host, cfg.port)
@@ -159,32 +194,108 @@ def create_app(cfg: Config | None = None) -> Litestar:
 
     @get("/api/status")
     async def api_status(store: Store) -> dict:
-        agents = await store.list_agents()
+        settings = await store.get_settings()
+        projects = [await _project_payload(store, p) for p in await store.list_projects()]
         return {
-            "repo": cfg.repo,
-            "label": cfg.label,
-            "agents": [agent_view(a) for a in agents],
-            "running": sum(1 for a in agents if a.status == "running"),
+            "settings": settings_view(settings),
+            "projects": projects,
+            "running": sum(p["running"] for p in projects),
         }
 
-    @get("/api/agents")
-    async def api_agents(store: Store) -> dict:
-        return {"agents": [agent_view(a) for a in await store.list_agents()]}
+    @get("/api/settings")
+    async def api_get_settings(store: Store) -> dict:
+        return settings_view(await store.get_settings())
 
-    @post("/api/agents")
-    async def api_add_agent(data: AgentCreate, store: Store) -> dict:
+    @patch("/api/settings")
+    async def api_patch_settings(data: SettingsUpdate, store: Store) -> dict:
+        fields = {k: v for k, v in structs.asdict(data).items() if v is not None}
+        return settings_view(await store.update_settings(**fields))
+
+    @get("/api/projects")
+    async def api_projects(store: Store) -> dict:
+        return {"projects": [await _project_payload(store, p) for p in await store.list_projects()]}
+
+    @post("/api/projects")
+    async def api_add_project(data: ProjectCreate, store: Store) -> dict:
+        title = data.title.strip()
+        repo = data.repo.strip()
+        if not repo:
+            raise HTTPException(status_code=400, detail="repo is required")
+        try:
+            project = await store.add_project(title, repo, label=data.label)
+        except ValueError as exc:
+            detail = str(exc)
+            code = 400 if "must be" in detail or "required" in detail else 409
+            raise HTTPException(status_code=code, detail=detail) from exc
+        try:
+            await poll_once(store, project.id)
+        except Exception:
+            log.exception("initial poll failed for %s", project.repo)
+        return await _project_payload(store, project)
+
+    @get("/api/projects/{project_id:uuid}")
+    async def api_project(project_id: UUID, store: Store) -> dict:
+        project = await store.get_project(project_id)
+        if project is None:
+            raise NotFoundException(detail="project not found")
+        return await _project_payload(store, project)
+
+    @patch("/api/projects/{project_id:uuid}")
+    async def api_update_project(project_id: UUID, data: ProjectUpdate, store: Store) -> dict:
+        fields = {k: v for k, v in structs.asdict(data).items() if v is not None}
+        try:
+            project = await store.update_project(project_id, **fields)
+        except KeyError as exc:
+            raise NotFoundException(detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return await _project_payload(store, project)
+
+    @delete("/api/projects/{project_id:uuid}", status_code=200)
+    async def api_delete_project(project_id: UUID, store: Store) -> dict:
+        try:
+            await store.delete_project(project_id)
+        except KeyError as exc:
+            raise NotFoundException(detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @post("/api/projects/{project_id:uuid}/poll")
+    async def api_poll_project(project_id: UUID, store: Store) -> dict:
+        project = await store.get_project(project_id)
+        if project is None:
+            raise NotFoundException(detail="project not found")
+        try:
+            count = await poll_once(store, project_id)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"ok": True, "count": count}
+
+    @get("/api/projects/{project_id:uuid}/agents")
+    async def api_project_agents(project_id: UUID, store: Store) -> dict:
+        project = await store.get_project(project_id)
+        if project is None:
+            raise NotFoundException(detail="project not found")
+        return {"agents": [agent_view(a) for a in await store.list_agents(project_id)]}
+
+    @post("/api/projects/{project_id:uuid}/agents")
+    async def api_add_agent(project_id: UUID, data: AgentCreate, store: Store) -> dict:
         name = data.name.strip()
         if not name:
             raise HTTPException(status_code=400, detail="name is required")
         try:
             agent = await store.add_agent(
                 name,
+                project_id=project_id,
                 persona=data.persona,
                 instructions=data.instructions,
                 mcp_servers=list(data.mcp_servers or []),
                 paused=data.paused,
             )
-        except Exception as exc:
+        except KeyError as exc:
+            raise NotFoundException(detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return agent_view(agent)
 
@@ -209,18 +320,64 @@ def create_app(cfg: Config | None = None) -> Litestar:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True}
 
-    @get("/api/issues")
-    async def api_issues(store: Store) -> dict:
-        issues = await store.list_issues(cfg.repo)
+    @get("/api/projects/{project_id:uuid}/tasks")
+    async def api_project_tasks(project_id: UUID, store: Store, agent_id: UUID | None = None) -> dict:
+        project = await store.get_project(project_id)
+        if project is None:
+            raise NotFoundException(detail="project not found")
+        issues = await store.list_issues(project_id)
         views = []
         for issue in issues:
+            latest = await store.latest_run_for_issue(issue.id)
             active = await store.active_run_for_issue(issue.id)
-            views.append(issue_view(issue, label=cfg.label, active_run=active))
-        return {"issues": views}
+            if agent_id is not None:
+                agent_runs = await store.list_runs(issue_id=issue.id, agent_id=agent_id, limit=1)
+                ready = issue.state == "open" and latest is None
+                if not agent_runs and not ready:
+                    continue
+                if agent_runs:
+                    latest = agent_runs[0]
+            views.append(task_view(issue, label=project.label, latest_run=latest, active_run=active))
+        return {"tasks": views}
 
-    @get("/api/runs")
-    async def api_runs(store: Store) -> dict:
-        return {"runs": [run_view(r) for r in await store.list_runs()]}
+    @get("/api/projects/{project_id:uuid}/issues/{issue_id:uuid}")
+    async def api_project_issue(project_id: UUID, issue_id: UUID, store: Store) -> dict:
+        project = await store.get_project(project_id)
+        if project is None:
+            raise NotFoundException(detail="project not found")
+        issue = await store.get_issue(issue_id)
+        if issue is None or issue.project_id != project_id:
+            raise NotFoundException(detail="task not found")
+        latest = await store.latest_run_for_issue(issue.id)
+        active = await store.active_run_for_issue(issue.id)
+        view = task_view(issue, label=project.label, latest_run=latest, active_run=active)
+        view["runs"] = [run_view(r) for r in await store.list_runs_for_issue(issue.id)]
+        return view
+
+    @get("/api/projects/{project_id:uuid}/tasks/{number:int}")
+    async def api_project_task(project_id: UUID, number: int, store: Store) -> dict:
+        project = await store.get_project(project_id)
+        if project is None:
+            raise NotFoundException(detail="project not found")
+        issue = await store.get_issue_by_number(project_id, number)
+        if issue is None:
+            raise NotFoundException(detail="task not found")
+        latest = await store.latest_run_for_issue(issue.id)
+        active = await store.active_run_for_issue(issue.id)
+        view = task_view(issue, label=project.label, latest_run=latest, active_run=active)
+        view["runs"] = [run_view(r) for r in await store.list_runs_for_issue(issue.id)]
+        return view
+
+    @post("/api/projects/{project_id:uuid}/tasks/{number:int}/run")
+    async def api_run_task(project_id: UUID, number: int, scheduler: Scheduler, store: Store) -> dict:
+        try:
+            run_id = await scheduler.enqueue_issue(project_id, number)
+        except KeyError as exc:
+            raise NotFoundException(detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        run = await store.get_run(run_id)
+        return run_view(run) if run else {"id": str(run_id), "status": "queued"}
 
     @get("/api/runs/{run_id:uuid}")
     async def api_run(run_id: UUID, store: Store) -> dict:
@@ -235,17 +392,6 @@ def create_app(cfg: Config | None = None) -> Litestar:
         if run is None:
             raise NotFoundException(detail="run not found")
         return {"messages": [message_view(m) for m in await store.list_messages(run_id)]}
-
-    @post("/api/issues/{number:int}/run")
-    async def api_run_issue(number: int, scheduler: Scheduler, store: Store) -> dict:
-        try:
-            run_id = await scheduler.enqueue_issue(number)
-        except KeyError as exc:
-            raise NotFoundException(detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        run = await store.get_run(run_id)
-        return run_view(run) if run else {"id": str(run_id), "status": "queued"}
 
     @post("/api/runs/{run_id:uuid}/stop")
     async def api_stop(run_id: UUID, store: Store, runner: Runner) -> dict:
@@ -270,15 +416,24 @@ def create_app(cfg: Config | None = None) -> Litestar:
 
     handlers: list = [
         api_status,
-        api_agents,
+        api_get_settings,
+        api_patch_settings,
+        api_projects,
+        api_add_project,
+        api_project,
+        api_update_project,
+        api_delete_project,
+        api_poll_project,
+        api_project_agents,
         api_add_agent,
         api_update_agent,
         api_delete_agent,
-        api_issues,
-        api_runs,
+        api_project_tasks,
+        api_project_issue,
+        api_project_task,
+        api_run_task,
         api_run,
         api_messages,
-        api_run_issue,
         api_stop,
         api_requeue,
     ]
@@ -305,18 +460,16 @@ def create_app(cfg: Config | None = None) -> Litestar:
     )
 
 
-def build_asgi(cfg: Config | None = None):
+def build_asgi(cfg: RuntimeConfig | None = None):
     app = create_app(cfg)
     return socketio.ASGIApp(sio, app)
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    cfg = load_config()
-    if not cfg.repo or cfg.repo == "OWNER/REPO":
-        print('Set repo = "OWNER/REPO" in config.toml before starting.', file=sys.stderr)
+    cfg = load_runtime()
     ensure_dirs(cfg)
-    check_tools(cfg)
+    check_gh()
     uvicorn.run(build_asgi(cfg), host=cfg.host, port=cfg.port, log_level="info")
 
 
