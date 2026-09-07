@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Orchestrator work data
+var/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Local config and junk
+config.toml
+*.log
+.DS_Store
